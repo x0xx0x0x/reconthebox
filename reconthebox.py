@@ -156,12 +156,12 @@ class ReconState:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BANNER_ART = r"""
- ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗    ████████╗██╗  ██╗███████╗    ██████╗  ██████╗ ██╗  ██╗
- ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║    ╚══██╔══╝██║  ██║██╔════╝    ██╔══██╗██╔═══██╗╚██╗██╔╝
- ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║       ██║   ███████║█████╗      ██████╔╝██║   ██║ ╚███╔╝
- ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║       ██║   ██╔══██║██╔══╝      ██╔══██╗██║   ██║ ██╔██╗
- ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║       ██║   ██║  ██║███████╗    ██████╔╝╚██████╔╝██╔╝ ██╗
- ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝       ╚═╝   ╚═╝  ╚═╝╚══════╝    ╚═════╝  ╚═════╝ ╚═╝  ╚═╝"""
+ ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗ ████████╗██╗  ██╗███████╗ ██████╗  ██████╗ ██╗  ██╗
+ ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║ ╚══██╔══╝██║  ██║██╔════╝ ██╔══██╗██╔═══██╗╚██╗██╔╝
+ ██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║    ██║   ███████║█████╗   ██████╔╝██║   ██║ ╚███╔╝
+ ██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║    ██║   ██╔══██║██╔══╝   ██╔══██╗██║   ██║ ██╔██╗
+ ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║    ██║   ██║  ██║███████╗ ██████╔╝╚██████╔╝██╔╝ ██╗
+ ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝    ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝"""
 
 TAGLINES = [
     "[ enumerate everything. trust nothing. ]",
@@ -893,7 +893,9 @@ def fuzz_directories(url: str, state: ReconState, extensions: str = COMMON_EXT) 
         info(f"Running: [bold cyan]{cmd_str}[/]")
 
         try:
-            subprocess.call(cmd)
+            env = os.environ.copy()
+            env["PYTHONWARNINGS"] = "ignore"
+            subprocess.call(cmd, env=env)
         except KeyboardInterrupt:
             warn("Caught keyboard interrupt (Ctrl-C) during dirsearch.")
         except Exception as exc:
@@ -1376,12 +1378,16 @@ def run_searchsploit(state: ReconState) -> None:
                 t = Table(
                     title=f"[htb.red]⚡ Exploits → {term}[/]",
                     box=box.SIMPLE_HEAD, border_style="red",
+                    expand=False
                 )
-                t.add_column("Title", style="bold white", max_width=55)
-                t.add_column("Type",  style="htb.yellow", width=14)
-                t.add_column("Path",  style="dim",        max_width=35)
+                t.add_column("EDB-ID", style="bold cyan", width=8, justify="center")
+                t.add_column("Title", style="bold white", overflow="fold")
+                t.add_column("Type",  style="htb.yellow")
+                t.add_column("Path",  style="dim")
                 for h in hits[:8]:
-                    t.add_row(h.get("Title", ""), h.get("Type", ""), h.get("Path", ""))
+                    edb = h.get("EDB-ID", "")
+                    # Ensure Title wraps nicely
+                    t.add_row(edb, h.get("Title", ""), h.get("Type", ""), h.get("Path", ""))
                 console.print(t)
                 break
             else:
@@ -1457,7 +1463,19 @@ def generate_report(state: ReconState) -> Path:
     for lnk in state.spider_links[:50]:
         lines.append(f"- `{lnk}`")
 
-    lines += ["", "## 6. Potential Exploits (Searchsploit)", ""]
+    lines += ["", "## 6. Nuclei Results", ""]
+    nuclei_out = state.workdir / "nuclei_results.txt"
+    if nuclei_out.exists():
+        nuclei_lines = nuclei_out.read_text().splitlines()
+        if nuclei_lines:
+            for l in nuclei_lines:
+                lines.append(f"- `{l}`")
+        else:
+            lines.append("*No vulnerabilities found by Nuclei.*")
+    else:
+        lines.append("*Nuclei scan was not run.*")
+
+    lines += ["", "## 7. Potential Exploits (Searchsploit)", ""]
     for term, hits in state.exploits.items():
         lines.append(f"### `{term}`")
         lines += ["| Title | Type | Path |", "|-------|------|------|"]
@@ -1539,6 +1557,18 @@ def print_summary(state: ReconState, report_path: Optional[Path] = None) -> None
     node_spider = tree.add(f"[htb.cyan]Spider[/]  {len(state.spider_links)} link(s)")
     for lnk in state.spider_links[:5]:
         node_spider.add(f"[dim]{lnk}[/]")
+
+    nuclei_out = state.workdir / "nuclei_results.txt"
+    if nuclei_out.exists():
+        nuclei_lines = nuclei_out.read_text().splitlines()
+        if nuclei_lines:
+            node_nuclei = tree.add(f"[htb.red]Nuclei[/]  {len(nuclei_lines)} issue(s)")
+            for l in nuclei_lines[:5]:
+                node_nuclei.add(f"[htb.red]{l}[/]")
+            if len(nuclei_lines) > 5:
+                node_nuclei.add(f"[dim]… and {len(nuclei_lines) - 5} more[/]")
+        else:
+            tree.add("[htb.cyan]Nuclei[/]  [dim]0 issue(s)[/]")
 
     node_exp = tree.add(f"[htb.red]Exploits[/]  {sum(len(v) for v in state.exploits.values())} hit(s)")
     for term, hits in state.exploits.items():
@@ -1665,13 +1695,37 @@ def main() -> None:
         else:
             warn(f"--wl-vhosts path not found: {args.wl_vhosts} — using default")
 
-    state = ReconState(
-        target    = args.target,
-        workdir   = workdir,
-        lab       = lab_name,
-        wl_dirs   = wl_dirs,
-        wl_vhosts = wl_vhosts,
-    )
+    state_file = workdir / "state.pkl"
+    state = None
+    
+    if state_file.exists():
+        from rich.prompt import Confirm
+        import pickle
+        if Confirm.ask("[htb.yellow]Previous session state found. Do you want to resume?[/]", default=True):
+            try:
+                with open(state_file, "rb") as f:
+                    state = pickle.load(f)
+                info("Session state loaded successfully.")
+            except Exception as e:
+                err(f"Failed to load state: {e}. Starting fresh.")
+                
+    if not state:
+        state = ReconState(
+            target    = args.target,
+            workdir   = workdir,
+            lab       = lab_name,
+            wl_dirs   = wl_dirs,
+            wl_vhosts = wl_vhosts,
+        )
+
+    # Helper function to save state after phases
+    def save_state():
+        import pickle
+        try:
+            with open(state_file, "wb") as f:
+                pickle.dump(state, f)
+        except Exception:
+            pass
 
     # Banner is printed in __main__ before argparse; print session panel here
     grid = Table.grid(padding=(0, 3))
@@ -1693,6 +1747,7 @@ def main() -> None:
 
     # ── Phase 2: Port Scanning ────────────────────────────────────────────────
     run_nmap(state, no_udp=args.no_udp)
+    save_state()
 
     if not state.ports:
         warn("No open ports found. Exiting.")
@@ -1718,6 +1773,7 @@ def main() -> None:
     # ── Phase 4: Protocol Enumeration ─────────────────────────────────────────
     if not args.no_proto:
         run_protocol_enum(state)
+        save_state()
     else:
         info("Protocol enumeration skipped (--no-proto).")
 
@@ -1780,6 +1836,7 @@ def main() -> None:
                 # Directory fuzzing (on main domain or IP)
                 fuzz_url = make_url(scheme, main_domain or state.target, port)
                 dirs = fuzz_directories(fuzz_url, state)
+                save_state()
 
                 # Vhost fuzzing (for each web port separately)
                 if main_domain:
@@ -1810,6 +1867,49 @@ def main() -> None:
             # Comment out the break below to fuzz ALL detected web ports
             break
 
+    # ── Phase 5.5: Nuclei ─────────────────────────────────────────────────────
+    if not args.no_fuzz and shutil.which("nuclei"):
+        section("NUCLEI  ·  VULNERABILITY SCAN")
+        urls_file = state.workdir / "nuclei_targets.txt"
+        nuclei_out = state.workdir / "nuclei_results.txt"
+        
+        targets = set()
+        for fp in state.fingerprints:
+            targets.add(fp["url"])
+        for vh in state.vhosts:
+            for wp in web_ports:
+                targets.add(make_url(wp["scheme"], vh, wp["port"]))
+                
+        if targets:
+            urls_file.write_text("\n".join(targets) + "\n")
+            info(f"Running Nuclei on {len(targets)} target(s)...")
+            cmd = [
+                "nuclei", "-l", str(urls_file),
+                "-tags", "cves,default-logins,exposed-panels,misconfiguration",
+                "-o", str(nuclei_out),
+                "-silent"
+            ]
+            cmd_str = " ".join(cmd)
+            info(f"Running: [bold cyan]{cmd_str}[/]")
+            try:
+                subprocess.call(cmd)
+            except KeyboardInterrupt:
+                warn("Caught keyboard interrupt (Ctrl-C) during nuclei.")
+            
+            if nuclei_out.exists():
+                lines = nuclei_out.read_text().splitlines()
+                if lines:
+                    ok(f"Nuclei found {len(lines)} issue(s)! Check {nuclei_out.name}")
+                    for line in lines[:10]:
+                        console.print(f"  [htb.crit]⚡[/] {line}")
+                    state.notes.append(f"Nuclei issues found: {len(lines)}")
+                else:
+                    info("Nuclei found no issues.")
+        else:
+            info("No web targets found for Nuclei.")
+            
+        save_state()
+
     # ── Phase 6: Searchsploit ─────────────────────────────────────────────────
     if not args.no_exploits:
         # Extract technologies from web fingerprints to query searchsploit
@@ -1839,6 +1939,29 @@ def main() -> None:
     # ── Phase 7: Report ───────────────────────────────────────────────────────
     report_path = generate_report(state)
     print_summary(state, report_path)
+    save_state()
+
+    # ── Exploit Downloader ────────────────────────────────────────────────────
+    if state.exploits and shutil.which("searchsploit"):
+        console.print()
+        from rich.prompt import Prompt
+        edb_ids = Prompt.ask(
+            "[htb.cyan]Do you want to download any exploits? (Enter EDB-ID comma-separated, or press Enter to skip)[/]",
+            default=""
+        ).strip()
+        
+        if edb_ids:
+            for edb in edb_ids.split(","):
+                edb = edb.strip()
+                if not edb: continue
+                # Searchsploit needs the clean ID (e.g. 50720)
+                cmd = ["searchsploit", "-m", edb]
+                info(f"Downloading exploit {edb}...")
+                proc = subprocess.run(cmd, cwd=state.workdir, capture_output=True, text=True)
+                if proc.returncode == 0:
+                    ok(f"Exploit {edb} saved to {state.workdir}/")
+                else:
+                    err(f"Failed to download {edb}: {proc.stderr.strip()}")
 
     ok("[htb.green]Reconnaissance complete.[/]")
 
