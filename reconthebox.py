@@ -14,11 +14,13 @@ import json
 import os
 import random
 import re
+import select
 import shutil
 import socket
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -337,30 +339,25 @@ def stream_process(
     """
     all_output: list[str] = []
 
-    # Print full command before starting
-    cmd_str = " ".join(cmd)
-    console.print(f"  [dim green]►[/] [dim]{cmd_str}[/]")
-
     # Count wordlist for progress
     total_lines = _wordlist_size(wordlist_path) if wordlist_path else 0
     lines_seen  = 0
 
     with Progress(
         SpinnerColumn(spinner_name="dots2", style="htb.green"),
-        TextColumn("[htb.dim]{task.description}"),
-        BarColumn(bar_width=None, style="dark_green", complete_style="htb.green"),
-        TaskProgressColumn(),
+        TextColumn("[htb.cyan]{task.description}"),
         TimeElapsedColumn(),
         console=console,
-        transient=False,
+        transient=True,  # Disappear when finished to keep output clean
         expand=True,
     ) as progress:
         cmd_str = " ".join(cmd)
+        # Shorten command string so it fits on one line nicely
+        short_cmd = cmd_str if len(cmd_str) < 80 else cmd_str[:77] + "..."
         task_id = progress.add_task(
-            label,
-            total=total_lines if total_lines > 0 else None,
+            f"{label} [dim]→ {short_cmd}[/]",
+            total=None,
         )
-        progress.update(task_id, description=f"{label} [dim]({cmd_str})[/]")
 
         try:
             proc = subprocess.Popen(
@@ -383,8 +380,8 @@ def stream_process(
                     lines_seen += 1
                     if line_handler:
                         line_handler(line)
-                    if verbose or (line_filter and line_filter(line)):
-                        console.print(f"    [dim]{line}[/]")
+                    # We no longer print raw lines to keep the terminal clean
+                    
                     # Advance progress bar
                     if total_lines > 0:
                         progress.update(task_id, completed=min(lines_seen, total_lines))
@@ -522,7 +519,6 @@ def nmap_fast_scan(state: ReconState, no_udp: bool = False) -> list[str]:
         "-oN", out_base + ".nmap",
         state.target,
     ]
-    info("Running: " + " ".join(cmd))
 
     captured: list[str] = []
 
@@ -556,7 +552,6 @@ def nmap_service_scan(state: ReconState, ports: list[str]) -> str:
         "-oN", out_base + ".nmap",
         state.target,
     ]
-    info("Running: " + " ".join(cmd))
 
     output = stream_process(
         cmd,
@@ -574,7 +569,6 @@ def nmap_udp_scan(state: ReconState) -> str:
         "-T4", "--min-rate", "2000",
         state.target,
     ]
-    info("Running: " + " ".join(cmd))
     output = stream_process(
         cmd,
         label=f"nmap UDP scan on {state.target}",
@@ -700,6 +694,271 @@ def make_url(scheme: str, host: str, port: int) -> str:
 #  WEB FINGERPRINTING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _detect_nextjs(url: str, html: str, headers: dict) -> dict:
+    """
+    Deep-scan a URL for Next.js fingerprints.
+
+    Returns a dict with keys:
+      detected  (bool)  – True if Next.js was found
+      version   (str)   – semver string if determinable, else ""
+      build_id  (str)   – buildId extracted from __NEXT_DATA__ if present
+      router    (str)   – "pages" | "app" | "unknown"
+      indicators (list) – human-readable detection evidence
+      cves      (list)  – applicable CVE strings with descriptions
+    """
+    result: dict = {
+        "detected":   False,
+        "version":    "",
+        "build_id":   "",
+        "router":     "unknown",
+        "indicators": [],
+        "cves":        [],
+    }
+    indicators = result["indicators"]
+    base = url.rstrip("/")
+
+    # ── 1. Header-based signals ───────────────────────────────────────────────
+    xpb = headers.get("x-powered-by", "").lower()
+    if "next" in xpb:
+        result["detected"] = True
+        indicators.append(f"X-Powered-By: {headers.get('x-powered-by', '')}")
+
+    for h in ("x-nextjs-redirect", "x-nextjs-cache",
+              "x-middleware-rewrite", "x-middleware-next",
+              "x-middleware-set-cookie", "next-action"):
+        if headers.get(h):
+            result["detected"] = True
+            indicators.append(f"header:{h}: {headers[h][:60]}")
+
+    # ── 2. HTML source patterns ───────────────────────────────────────────────
+    if "__NEXT_DATA__" in html:
+        result["detected"] = True
+        result["router"]   = "pages"
+        indicators.append("__NEXT_DATA__ JSON block (Pages Router)")
+        # Try to extract buildId from __NEXT_DATA__
+        bd_m = re.search(r'"buildId"\s*:\s*"([^"]{4,80})"', html)
+        if bd_m:
+            result["build_id"] = bd_m.group(1)
+            indicators.append(f"buildId: {result['build_id']}")
+
+    if "/_next/static/" in html or "/_next/image" in html:
+        result["detected"] = True
+        indicators.append("/_next/ asset paths in HTML")
+
+    if "/_next/static/chunks/app/" in html or "__NEXT_APP__" in html:
+        result["router"] = "app"
+        indicators.append("App Router detected (/_next/static/chunks/app/)")
+
+    # ── 3. Active probing of well-known Next.js endpoints ────────────────────
+    probe_endpoints = [
+        ("/_next/static/",                 "/_next/static/ accessible"),
+        ("/_next/static/chunks/main.js",   "main.js chunk reachable"),
+        ("/_next/image",                   "/_next/image optimiser reachable"),
+    ]
+    for path, label in probe_endpoints:
+        try:
+            r = requests.head(base + path, timeout=5, verify=False,
+                              allow_redirects=False)
+            if r.status_code < 400:
+                result["detected"] = True
+                indicators.append(label)
+        except Exception:
+            pass
+
+    # ── 4. Version extraction (multiple strategies) ───────────────────────────
+    #
+    # Strategy A: exposed package.json
+    if not result["version"]:
+        for path in ("/package.json", "/.next/package.json"):
+            try:
+                r = requests.get(base + path, timeout=5, verify=False)
+                if r.status_code == 200 and '"next"' in r.text:
+                    ver_m = re.search(r'"next"\s*:\s*"[~^]?([0-9]+\.[0-9]+[^"]*?)"', r.text)
+                    if ver_m:
+                        result["version"] = ver_m.group(1)
+                        indicators.append(f"version from package.json: {result['version']}")
+                        break
+            except Exception:
+                pass
+
+    # Strategy B: version string in main JS chunk
+    # Next.js embeds version in `/_next/static/chunks/main.js` or framework.js
+    if not result["version"]:
+        for chunk in ("/_next/static/chunks/main.js",
+                      "/_next/static/chunks/framework.js",
+                      "/_next/static/chunks/polyfills.js"):
+            try:
+                r = requests.get(base + chunk, timeout=8, verify=False)
+                if r.status_code == 200:
+                    # Pattern: "next":"15.0.3" or next/dist version strings
+                    vm = re.search(
+                        r'"next"\s*:\s*"([0-9]+\.[0-9]+\.[0-9][^"]{0,20})"',
+                        r.text
+                    )
+                    if not vm:
+                        # Alternate: version=15.0.3 or NEXT_VERSION="15.0.3"
+                        vm = re.search(
+                            r'(?:NEXT_VERSION|nextVersion|"version")\s*[=:]\s*["\']([0-9]+\.[0-9]+\.[0-9][^"\']{0,15})["\']',
+                            r.text
+                        )
+                    if vm:
+                        result["version"] = vm.group(1)
+                        indicators.append(f"version from {chunk.split('/')[-1]}: {result['version']}")
+                        break
+            except Exception:
+                pass
+
+    # Strategy C: _buildManifest.js from buildId (buildId must be known)
+    if not result["version"] and result["build_id"]:
+        manifest_path = f"/_next/static/{result['build_id']}/_buildManifest.js"
+        try:
+            r = requests.get(base + manifest_path, timeout=5, verify=False)
+            if r.status_code == 200:
+                # Extract version from manifest comments or embedded strings
+                vm = re.search(r'"next"\s*:\s*"([0-9]+\.[0-9]+\.[^"]+)"', r.text)
+                if vm:
+                    result["version"] = vm.group(1)
+                    indicators.append(f"version from _buildManifest: {result['version']}")
+        except Exception:
+            pass
+
+    # Strategy D: version in HTML meta generator or hidden comment
+    if not result["version"]:
+        vm = re.search(r'next[/ @v]+([0-9]+\.[0-9]+\.[0-9][^"\' <>]{0,15})', html, re.I)
+        if vm:
+            candidate = vm.group(1).strip(".,;")
+            if re.match(r'^[0-9]+\.[0-9]+', candidate):
+                result["version"] = candidate
+                indicators.append(f"version from HTML pattern: {result['version']}")
+
+    # Check for App Router chunks directory (Next.js 13+).
+    # Only trust the HTTP probe when the HTML does NOT already contain
+    # __NEXT_DATA__ (which is a definitive Pages Router signal and takes
+    # precedence over a speculative HTTP probe).
+    if "__NEXT_DATA__" not in html:
+        try:
+            r = requests.head(base + "/_next/static/chunks/app/", timeout=5,
+                              verify=False, allow_redirects=False)
+            if r.status_code == 200:
+                result["router"] = "app"
+                indicators.append("App Router chunks directory present (Next.js 13+)")
+        except Exception:
+            pass
+
+    if not result["detected"]:
+        return result
+
+    # ── 5. CVE applicability (version-gated) ──────────────────────────────────
+    ver_str = result["version"]
+    router  = result["router"]
+    cves    = result["cves"]
+
+    # Parse semver for version-gating.
+    # major.minor.patch  →  (major, minor, patch) as ints
+    # Returns None if version is unknown.
+    def _parse_ver(v: str):
+        m = re.match(r'^(\d+)\.(\d+)(?:\.(\d+))?', v)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+    parsed = _parse_ver(ver_str) if ver_str else None
+    major  = parsed[0] if parsed else None
+
+    # ── CVE-2025-55182 [CVSS:10.0 RCE] ───────────────────────────────────────
+    # RSC Flight protocol insecure deserialization (Next.js 15.x / 16.x)
+    # Requires App Router + Server Actions, but even without router confirmation
+    # any Next.js 15.x / 16.x installation should be flagged because:
+    #   – Most Next.js 15+ apps use App Router by default
+    #   – The CVE affects even "hybrid" apps that partially use RSC
+    # Fixed in: 15.0.5, 15.1.9, 15.2.6, 15.3.6, 15.4.8, 15.5.7, 16.0.7
+    rce_applies = False
+    if router == "app":
+        rce_applies = True       # confirmed App Router — definite risk
+    elif major is not None and major >= 15:
+        rce_applies = True       # version ≥ 15 — very likely App Router
+    elif major is None:
+        # Version unknown: flag as possible if we detected Next.js at all
+        # (conservative — better to over-report than miss an RCE)
+        rce_applies = True
+
+    if rce_applies:
+        router_note = (
+            "App Router + Server Actions confirmed"
+            if router == "app"
+            else f"Next.js {ver_str or 'unknown'} — check if App Router is used"
+        )
+        cves.append(
+            f"CVE-2025-55182 [CVSS:10.0 RCE] — "
+            f"RSC Flight protocol insecure deserialization; "
+            f"affects 15.x/16.x | {router_note}"
+        )
+
+    # ── CVE-2025-29927 [CVSS:9.1 AUTH-BYPASS] ────────────────────────────────
+    # x-middleware-subrequest header bypass
+    # Affects: 11.1.4–12.3.4, 13.0–13.5.8, 14.0–14.2.24, 15.0–15.2.2
+    # Fixed: 12.3.5, 13.5.9, 14.2.25, 15.2.3   (EDB-ID 52124)
+    bypass_applies = False
+    if parsed is None:
+        bypass_applies = True    # version unknown → assume vulnerable
+    else:
+        maj, min_, pat = parsed
+        if maj == 11 and (min_, pat) >= (1, 4):
+            bypass_applies = True
+        elif maj == 12 and (min_, pat) <= (3, 4):
+            bypass_applies = True
+        elif maj == 13 and (min_, pat) <= (5, 8):
+            bypass_applies = True
+        elif maj == 14 and (
+            min_ < 2 or (min_ == 2 and pat <= 24)
+        ):
+            bypass_applies = True
+        elif maj == 15 and (
+            min_ < 2 or (min_ == 2 and pat <= 2)
+        ):
+            bypass_applies = True   # 15.0.x, 15.1.x, 15.2.0–15.2.2
+
+    if bypass_applies:
+        cves.append(
+            "CVE-2025-29927 [CVSS:9.1 AUTH-BYPASS] — "
+            "x-middleware-subrequest header bypass; "
+            f"affects 11.1.4–15.2.2 | EDB-ID 52124"
+            + (f" | version {ver_str} is in range" if ver_str else "")
+        )
+
+    # ── CVE-2024-51479 [CVSS:7.5 AUTH-BYPASS] ────────────────────────────────
+    # i18n routing bypass — affects 9.5.5–14.2.14, fixed in 14.2.15
+    i18n_applies = False
+    if parsed is None:
+        i18n_applies = True
+    else:
+        maj, min_, pat = parsed
+        if maj <= 13:
+            i18n_applies = True
+        elif maj == 14 and (min_ < 2 or (min_ == 2 and pat <= 14)):
+            i18n_applies = True
+        # Next.js 15.x is NOT affected
+
+    if i18n_applies:
+        cves.append(
+            "CVE-2024-51479 [CVSS:7.5 AUTH-BYPASS] — "
+            "i18n routing bypass; affects 9.5.5–14.2.14"
+            + (f" | version {ver_str} is in range" if ver_str else "")
+        )
+
+    # ── CVE-2020-5284 [PATH-TRAVERSAL] ───────────────────────────────────────
+    # Access .next build artifacts — affects < 9.3.2
+    if parsed:
+        maj, min_, pat = parsed
+        if maj < 9 or (maj == 9 and min_ < 3) or (maj == 9 and min_ == 3 and pat < 2):
+            cves.append(
+                "CVE-2020-5284 [PATH-TRAVERSAL] — "
+                "access .next build artifacts; affects < 9.3.2"
+            )
+
+    return result
+
+
 def fingerprint_web(url: str, workdir: Optional[Path] = None) -> dict:
     fp: dict = {"url": url}
 
@@ -720,8 +979,9 @@ def fingerprint_web(url: str, workdir: Optional[Path] = None) -> dict:
         fp["final_url"]    = resp.url
         title_m            = re.search(r"<title[^>]*>([^<]+)</title>", resp.text, re.I)
         fp["title"]        = title_m.group(1).strip() if title_m else ""
+        html_body          = resp.text
 
-        # Extract version for Wing FTP Server
+        # ── Extract version for Wing FTP Server ───────────────────────────────
         if "Wing FTP Server" in fp["server"]:
             try:
                 r2 = requests.get(url.rstrip("/") + "/login.html", timeout=HTTP_TIMEOUT, verify=False)
@@ -731,14 +991,85 @@ def fingerprint_web(url: str, workdir: Optional[Path] = None) -> dict:
             except Exception:
                 pass
 
+        # ── Comprehensive Tech Detection (Wappalyzer-like) ────────────────────
         hints = []
-        for cname in fp["cookies"]:
-            if "PHPSESSID"  in cname: hints.append("PHP")
-            if "JSESSIONID" in cname: hints.append("Java/Tomcat")
-            if "ASP.NET"    in cname: hints.append("ASP.NET")
-            if "laravel"    in cname.lower(): hints.append("Laravel")
-            if "wordpress"  in cname.lower(): hints.append("WordPress")
-        fp["tech_hints"] = list(set(hints))
+        srv_header = fp["server"].lower()
+        xpb_header = fp["x_powered_by"].lower()
+        xgen_header = fp["x_generator"].lower()
+        headers_combined = f"{srv_header} {xpb_header} {xgen_header}"
+
+        # 1. Servers
+        if "nginx" in srv_header:
+            m = re.search(r"nginx/([\d\.]+)", fp["server"], re.I)
+            hints.append(f"Nginx {m.group(1)}" if m else "Nginx")
+        elif "apache" in srv_header:
+            m = re.search(r"apache/([\d\.]+)", fp["server"], re.I)
+            hints.append(f"Apache {m.group(1)}" if m else "Apache")
+        if "tomcat" in srv_header or "tomcat" in xpb_header:
+            m = re.search(r"tomcat/([\d\.]+)", fp["server"] + fp["x_powered_by"], re.I)
+            hints.append(f"Apache Tomcat {m.group(1)}" if m else "Apache Tomcat")
+
+        # 2. Languages / Runtimes
+        if "php" in headers_combined or any("PHPSESSID" in c for c in fp["cookies"]):
+            m = re.search(r"php/([\d\.]+)", fp.get("x_powered_by", "") + fp.get("server", ""), re.I)
+            hints.append(f"PHP {m.group(1)}" if m else "PHP")
+        if "node.js" in headers_combined or "nodejs" in headers_combined:
+            hints.append("Node.js")
+        if "asp.net" in headers_combined or any("ASP.NET" in c for c in fp["cookies"]):
+            m = re.search(r"asp\.net(?:/([\d\.]+))?", fp.get("x_powered_by", ""), re.I)
+            hints.append(f"ASP.NET {m.group(1)}" if m and m.group(1) else "ASP.NET")
+        if "python" in srv_header:
+            m = re.search(r"python/([\d\.]+)", fp["server"], re.I)
+            hints.append(f"Python {m.group(1)}" if m else "Python")
+
+        # 3. CMS & Portals (WordPress, Liferay)
+        if "wp-content" in html_body or "wp-includes" in html_body or "wordpress" in headers_combined:
+            m = re.search(r'<meta name="generator" content="WordPress ([\d\.]+)"', html_body, re.I)
+            hints.append(f"WordPress {m.group(1)}" if m else "WordPress")
+            
+        if "liferay" in headers_combined or "Liferay" in html_body or "liferay-theme" in html_body:
+            m = re.search(r'Liferay (?:Portal |Digital Experience Platform )?([\d\.]+ \w+ \w+ \([^)]+\))', html_body, re.I)
+            if not m:
+                m = re.search(r'Liferay (?:Portal |Digital Experience Platform )?([\d\.]+)', html_body, re.I)
+            hints.append(f"Liferay {m.group(1)}" if m else "Liferay")
+
+        # 4. Web Frameworks (Express, Django, Rails, Laravel)
+        if "express" in headers_combined:
+            hints.append("Express")
+        if "django" in headers_combined:
+            hints.append("Django")
+        if "rails" in headers_combined:
+            hints.append("Ruby on Rails")
+        if "laravel" in headers_combined or any("laravel" in c.lower() for c in fp["cookies"]):
+            hints.append("Laravel")
+
+        # 5. Frontend Frameworks (React, Vue, Angular)
+        if 'data-reactroot' in html_body or '_reactRootContainer' in html_body or 'react-dom' in html_body:
+            hints.append("React")
+        if 'ng-app' in html_body or 'ng-version=' in html_body:
+            m = re.search(r'ng-version="([\d\.]+)"', html_body)
+            hints.append(f"Angular {m.group(1)}" if m else "Angular")
+        if 'data-v-' in html_body or 'Vue' in fp.get("x_powered_by", ""):
+            hints.append("Vue.js")
+
+        # ── Next.js deep detection ────────────────────────────────────────────
+        all_headers = {k.lower(): v for k, v in resp.headers.items()}
+        nxt = _detect_nextjs(url, html_body, all_headers)
+        fp["nextjs"] = nxt
+        if nxt["detected"]:
+            label = "Next.js"
+            if nxt["version"]:
+                label += f" {nxt['version']}"
+            if nxt["router"] != "unknown":
+                label += f" ({nxt['router']} router)"
+            if label not in hints:
+                hints.append(label)
+
+        # Deduplicate while preserving order and filter empty strings
+        fp["tech_hints"] = []
+        for h in hints:
+            if h and h not in fp["tech_hints"]:
+                fp["tech_hints"].append(h)
 
         parsed = urlparse(resp.url)
         orig   = urlparse(url)
@@ -755,7 +1086,7 @@ def fingerprint_web(url: str, workdir: Optional[Path] = None) -> dict:
 
 def display_fingerprint(fp: dict) -> None:
     t = Table.grid(padding=(0, 2))
-    t.add_column(style="dim green", width=16)
+    t.add_column(style="dim green", width=18)
     t.add_column(style="white")
 
     fields = [
@@ -775,6 +1106,24 @@ def display_fingerprint(fp: dict) -> None:
     if fp.get("whatweb"):
         excerpt = fp["whatweb"][:240]
         t.add_row("WhatWeb", excerpt)
+
+    # ── Next.js specific block ────────────────────────────────────────────────
+    nxt = fp.get("nextjs", {})
+    if nxt.get("detected"):
+        nxt_parts = []
+        if nxt.get("version"):  nxt_parts.append(f"v{nxt['version']}")
+        if nxt.get("router") != "unknown": nxt_parts.append(f"{nxt['router']} router")
+        if nxt.get("build_id"): nxt_parts.append(f"buildId={nxt['build_id'][:20]}…")
+        nxt_summary = "Next.js" + (" | " + " | ".join(nxt_parts) if nxt_parts else "")
+        t.add_row("[bold bright_green]Framework[/]", f"[bold bright_green]{nxt_summary}[/]")
+
+        for ind in nxt["indicators"][:6]:
+            t.add_row("", f"[dim]↳ {ind}[/]")
+
+        for cve in nxt.get("cves", []):
+            severity = "htb.red" if "RCE" in cve or "CVSS:9" in cve or "CVSS:10" in cve else "htb.yellow"
+            t.add_row("[bold red]CVE Alert[/]", f"[{severity}]{cve}[/]")
+
     if fp.get("error"):
         t.add_row("Error", f"[htb.red]{fp['error']}[/]")
 
@@ -799,7 +1148,7 @@ def passive_spider(url: str, state: ReconState) -> list[str]:
         SpinnerColumn(spinner_name="dots", style="htb.cyan"),
         TextColumn("[htb.dim]{task.description}"),
         console=console,
-        transient=False,
+        transient=True,
     ) as progress:
         t = progress.add_task(f"fetching {url}", total=None)
 
@@ -823,17 +1172,52 @@ def passive_spider(url: str, state: ReconState) -> list[str]:
                     if clean and clean != "/":
                         links.add(clean)
 
+            def _extract_crawled_versions(text: str, current_url: str):
+                versions = []
+                # Next.js
+                vm = re.search(r'(?:NEXT_VERSION|nextVersion|"version"|"next")\s*[=:]\s*["\']([0-9]+\.[0-9]+\.[0-9][^"\' <>]{0,15})["\']', text)
+                if vm: versions.append(f"Next.js {vm.group(1)}")
+                # React
+                rm = re.search(r'React\s*v?([0-9]+\.[0-9]+\.[0-9][^"\' <>]{0,10})', text, re.I)
+                if rm: versions.append(f"React {rm.group(1)}")
+                # Vue
+                vum = re.search(r'Vue\.js v?([0-9]+\.[0-9]+\.[0-9][^"\' <>]{0,10})', text, re.I)
+                if vum: versions.append(f"Vue.js {vum.group(1)}")
+
+                if versions:
+                    for fp in state.fingerprints:
+                        if fp.get("url", "").rstrip("/") == current_url.rstrip("/"):
+                            for v in versions:
+                                if v not in fp.setdefault("tech_hints", []):
+                                    fp["tech_hints"].append(v)
+                                if "Next.js" in v:
+                                    nxt = fp.get("nextjs", {})
+                                    nxt["detected"] = True
+                                    if not nxt.get("version"):
+                                        nxt["version"] = v.split()[-1]
+                                        nxt.setdefault("indicators", []).append("version extracted during passive spidering")
+                                    fp["nextjs"] = nxt
+
+            # Extract from main body
+            _extract_crawled_versions(body, url)
+
             # Depth-0: root
             for m in _LINK_RE.finditer(body):
                 process_href(m.group(1))
 
             # Depth-1: follow relative links that look like pages
-            depth1_targets = [h for h in list(links)[:15] if h.startswith("/")]
+            rel_links = [h for h in links if h.startswith("/")]
+            # Prioritize JS files for framework version extraction
+            js_links = [h for h in rel_links if h.endswith(".js")]
+            other_links = [h for h in rel_links if not h.endswith(".js")]
+            depth1_targets = (js_links + other_links)[:25]
+
             for path in depth1_targets:
                 sub_url = url.rstrip("/") + path
                 try:
-                    progress.update(t, description=f"spidering {path}")
+                    progress.update(t, description=f"spidering {path[:60]}")
                     r2 = requests.get(sub_url, timeout=8, verify=False, allow_redirects=True)
+                    _extract_crawled_versions(r2.text, url)
                     for m in _LINK_RE.finditer(r2.text):
                         process_href(m.group(1))
                 except Exception:
@@ -856,6 +1240,202 @@ def passive_spider(url: str, state: ReconState) -> list[str]:
         info("No internal links extracted.")
 
     return sorted_links
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FFUF SMART DYNAMIC FILTER  (probe → detect noise → rerun with filters)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _strip_ffuf_flags(cmd: list[str], *flags: str) -> list[str]:
+    """Return a copy of *cmd* with the given flags (and their values) removed."""
+    result: list[str] = []
+    skip_next = False
+    for tok in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in flags:
+            skip_next = True  # also drop the value that follows
+            continue
+        result.append(tok)
+    return result
+
+
+def _run_ffuf_smart_filter(
+    cmd_base: list[str],
+    probe_limit: int = 30,
+    threshold: float = 0.6,
+) -> tuple[list[str], list[str]]:
+    """
+    Run ffuf with automatic false-positive filtering.
+
+    Strategy
+    --------
+    Phase 1 — Silent probe
+        Execute ffuf invisibly using ``-json`` (newline-delimited JSON to stdout)
+        so every hit is a parseable JSON object containing ``length`` (size) and
+        ``words``.  After collecting ``probe_limit`` hits the probe is killed.
+
+    Phase 2 — Noise detection
+        Count occurrences of each (size, words) value.  Any value that appears
+        in ≥ ``threshold`` of the sample is considered the baseline noise for
+        that web server (e.g. a catch-all 404 page with a fixed size).  The
+        corresponding ``-fs`` / ``-fw`` filters are built.
+
+    Phase 3 — Filtered live scan
+        Re-run ffuf **without** ``-s``/``-json``, with the derived filters
+        applied.  ffuf’s banner, progress bar, and coloured hits are displayed
+        directly to the terminal so the user sees only real results.
+
+    Returns
+    -------
+    (filter_sizes, filter_words)
+        String representations of the filter values that were applied
+        (empty lists if none were needed).
+    """
+    # ── Phase 1: silent probe ─────────────────────────────────────────────────
+    #
+    # Build probe command:
+    #  - strip any -o/-of that point to the caller’s output file (we don’t want
+    #    the probe to overwrite it)
+    #  - strip any existing -fs/-fw/-fc filters (clean baseline measurement)
+    #  - add ``-json`` so every hit is emitted as a JSON object on stdout
+    #  - add ``-s`` to suppress the progress bar / banner
+    #  - add ``-maxtime-job 60`` as a safety cap so the probe can’t run forever
+    #
+    probe_cmd = _strip_ffuf_flags(
+        cmd_base,
+        "-o", "-of",    # separate output file; probe doesn’t need one
+        "-fs", "-fw", "-fc", "-fl",  # strip caller-supplied filters
+    )
+    # Remove flags that don’t take a value (positional-style)
+    probe_cmd = [t for t in probe_cmd if t not in ("-s", "-c", "-json")]
+    probe_cmd += ["-s", "-json", "-maxtime-job", "60", "-noninteractive"]
+
+    info("[dim]► Probe scan: sampling responses to detect false-positive baseline…[/]")
+
+    probe_sizes: list[int] = []
+    probe_words: list[int] = []
+    probe_lines_seen = 0
+
+    try:
+        proc = subprocess.Popen(
+            probe_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+        # ffuf -json emits one JSON object per line for every matched result.
+        # Example line:
+        #   {"input":{...},"position":1,"status":200,"length":4242,"words":312,
+        #    "lines":80,"content-type":"text/html","redirectlocation":"",
+        #    "url":"http://...","duration":123456,"scraper":{},"resultfile":"",
+        #    "host":"sub.domain.htb"}
+        while True:
+            if proc.stdout is None:
+                break
+            rlist, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if rlist:
+                raw = proc.stdout.readline()
+                if not raw:          # EOF
+                    break
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                    size  = obj.get("length", obj.get("size", -1))
+                    words = obj.get("words", -1)
+                    if size >= 0 and words >= 0:
+                        probe_sizes.append(int(size))
+                        probe_words.append(int(words))
+                        probe_lines_seen += 1
+                        if probe_lines_seen >= probe_limit:
+                            break
+                except json.JSONDecodeError:
+                    pass  # non-JSON line (e.g. ffuf informational messages)
+            else:
+                if proc.poll() is not None:
+                    break
+
+        # Kill the probe — we have enough data (or it finished naturally)
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    except KeyboardInterrupt:
+        warn("Caught keyboard interrupt during probe scan.")
+        return [], []
+    except Exception as exc:
+        warn(f"[dim]Probe scan error: {exc}[/]")
+        return [], []
+
+    # ── Phase 2: noise analysis ────────────────────────────────────────────────
+    filter_sizes: list[str] = []
+    filter_words: list[str] = []
+
+    if probe_lines_seen == 0:
+        info("[dim]  No hits during probe — no auto-filter applied.[/]")
+    else:
+        sample = probe_lines_seen
+        size_counter = Counter(probe_sizes)
+        word_counter = Counter(probe_words)
+
+        # A value is "noisy" if it accounts for ≥ threshold of the sample
+        noisy_sizes = [
+            str(v) for v, cnt in size_counter.most_common()
+            if cnt / sample >= threshold
+        ]
+        noisy_words = [
+            str(v) for v, cnt in word_counter.most_common()
+            if cnt / sample >= threshold
+        ]
+
+        if noisy_sizes or noisy_words:
+            parts: list[str] = []
+            if noisy_sizes:
+                filter_sizes = noisy_sizes
+                parts.append(f"-fs {','.join(noisy_sizes)}")
+            if noisy_words:
+                filter_words = noisy_words
+                parts.append(f"-fw {','.join(noisy_words)}")
+            info(
+                f"[bold yellow]⚠ Auto-filter:[/] "
+                + ", ".join(parts)
+                + f"  [dim](detected from {sample}/{probe_limit} probe hits)[/]"
+            )
+        else:
+            info(
+                f"[dim]  Probe collected {sample} hits — "
+                "no dominant noise pattern found, no extra filters applied.[/]"
+            )
+
+    # ── Phase 3: filtered live scan ────────────────────────────────────────────
+    final_cmd = [t for t in cmd_base if t not in ("-s", "-json")]
+    final_cmd += ["-s"]  # Make silent to prevent raw output clutter
+
+    if filter_sizes:
+        final_cmd += ["-fs", ",".join(filter_sizes)]
+    if filter_words:
+        final_cmd += ["-fw", ",".join(filter_words)]
+
+    try:
+        stream_process(
+            final_cmd,
+            label="ffuf vhost fuzzing",
+            timeout=FUZZ_TIMEOUT
+        )
+    except KeyboardInterrupt:
+        warn("Caught keyboard interrupt (Ctrl-C) during ffuf.")
+    except Exception as exc:
+        err(f"ffuf error: {exc}")
+
+    return filter_sizes, filter_words
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DIRECTORY FUZZING — LIVE OUTPUT (ffuf → dirsearch → gobuster)
@@ -889,13 +1469,13 @@ def fuzz_directories(url: str, state: ReconState, extensions: str = COMMON_EXT) 
             "-i", "200,204,301,302,307,401,405"
         ]
 
-        cmd_str = " ".join(cmd)
-        info(f"Running: [bold cyan]{cmd_str}[/]")
-
         try:
             env = os.environ.copy()
             env["PYTHONWARNINGS"] = "ignore"
-            subprocess.call(cmd, env=env)
+            cmd_str = " ".join(cmd)
+            short_cmd = cmd_str if len(cmd_str) < 80 else cmd_str[:77] + "..."
+            with console.status(f"[htb.cyan]dirsearch scanning...[/] [dim]→ {short_cmd}[/]", spinner="dots2"):
+                subprocess.call(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except KeyboardInterrupt:
             warn("Caught keyboard interrupt (Ctrl-C) during dirsearch.")
         except Exception as exc:
@@ -928,11 +1508,11 @@ def fuzz_directories(url: str, state: ReconState, extensions: str = COMMON_EXT) 
             "-q",
         ]
         
-        cmd_str = " ".join(cmd)
-        info(f"Running: [bold cyan]{cmd_str}[/]")
-
         try:
-            subprocess.call(cmd)
+            cmd_str = " ".join(cmd)
+            short_cmd = cmd_str if len(cmd_str) < 80 else cmd_str[:77] + "..."
+            with console.status(f"[htb.cyan]gobuster scanning...[/] [dim]→ {short_cmd}[/]", spinner="dots2"):
+                subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except KeyboardInterrupt:
             warn("Caught keyboard interrupt (Ctrl-C) during gobuster.")
         except Exception as exc:
@@ -1014,26 +1594,19 @@ def fuzz_vhosts_smart(
         
     url = make_url(proto, state.target, port).rstrip("/")
         
-    cmd = [
-        "ffuf", "-c", "-s",
+    # Base command without -s so the final filtered scan shows live output
+    cmd_base = [
+        "ffuf", "-c",
         "-u", url,
         "-w", wordlist,
         "-H", f"Host:FUZZ.{domain}",
-        "-mc", "200",
+        "-mc", "200,301,302,307,401,403",
         "-o", out_json,
-        "-of", "json"
+        "-of", "json",
     ]
 
-    cmd_str = " ".join(cmd)
-    info(f"Running: [bold cyan]{cmd_str}[/]")
-    
-    # Run ffuf natively to display its real-time progress bar and banner directly
-    try:
-        subprocess.call(cmd)
-    except KeyboardInterrupt:
-        warn("Caught keyboard interrupt (Ctrl-C) during ffuf.")
-    except Exception as exc:
-        err(f"ffuf error: {exc}")
+    # Run smart filter: probe silently, detect noise, rerun with filters applied
+    _run_ffuf_smart_filter(cmd_base)
 
     # Parse JSON output for results
     if os.path.exists(out_json):
@@ -1041,11 +1614,24 @@ def fuzz_vhosts_smart(
             with open(out_json, "r") as f:
                 data = json.load(f)
                 for res in data.get("results", []):
-                    sub = res.get("host", "").split(".")[0]
+                    # Primary: FUZZ keyword value (what was actually fuzzed)
+                    inputs = res.get("input", {})
+                    sub = inputs.get("FUZZ", "").strip()
+                    # Fallback: parse the 'host' field if FUZZ is not present
+                    if not sub:
+                        host_field = res.get("host", "")
+                        sub = host_field.split(".")[0] if host_field else ""
+                    if not sub:
+                        continue
                     vhost = f"{sub}.{domain}"
                     if vhost not in found_set:
                         found_set.add(vhost)
-                        ok(f"FFUF VHOST FOUND: [bold white]{vhost}[/]  [{res.get('status')}]")
+                        ok(
+                            f"FFUF VHOST FOUND: [bold white]{vhost}[/]"
+                            f"  [dim][{res.get('status')} | "
+                            f"size:{res.get('length','?')} | "
+                            f"words:{res.get('words','?')}][/]"
+                        )
         except Exception as e:
             err(f"Error parsing ffuf JSON: {e}")
 
@@ -1354,44 +1940,133 @@ def run_searchsploit(state: ReconState) -> None:
     if not shutil.which("searchsploit"):
         warn("searchsploit not found — skipping exploit search.")
         return
-    if not state.services:
-        info("No services to query.")
+    if not state.services and not state.fingerprints:
+        info("No services or fingerprints to query.")
         return
 
+    # ── Build the query terms list ────────────────────────────────────────────
+    # Order: detected frameworks first (highest value), then nmap services.
+    seen_terms: set[str] = set()
+    query_items: list[tuple[str, str]] = []   # (display_label, searchsploit_term)
+
+    # 1. Extract frameworks / technologies from web fingerprints
+    for fp in state.fingerprints:
+        # Next.js — targeted CVE-aware queries
+        nxt = fp.get("nextjs", {})
+        if nxt.get("detected"):
+            ver = nxt.get("version", "")
+            for term in ([f"Next.js {ver}", "Next.js"] if ver else ["Next.js"]):
+                if term not in seen_terms:
+                    seen_terms.add(term)
+                    query_items.append((f"Next.js{'  v'+ver if ver else ''}", term))
+            # Always also try CVEs directly in searchsploit
+            for cve_term in ("CVE-2025-29927", "CVE-2025-55182", "Next.js middleware"):
+                if cve_term not in seen_terms:
+                    seen_terms.add(cve_term)
+                    query_items.append((cve_term, cve_term))
+
+
+        # Generic tech_hints (Laravel, WordPress, PHP, Express, etc.)
+        for hint in fp.get("tech_hints", []):
+            # Strip version from label e.g. "Next.js 15.2.1 (pages router)"
+            base_hint = re.split(r'[ /]', hint)[0].strip()
+            if base_hint and base_hint not in seen_terms and "Next" not in base_hint:
+                seen_terms.add(base_hint)
+                query_items.append((hint, base_hint))
+
+        # Server header (e.g. "Apache/2.4.49", "nginx/1.18")
+        for key in ("server", "x_powered_by"):
+            val = fp.get(key, "")
+            if not val:
+                continue
+            clean = re.sub(r'\(.*?\)', '', val).strip()
+            parts = clean.split("/")
+            svc_name = parts[0].strip()
+            svc_ver  = parts[1].strip() if len(parts) > 1 else ""
+            if svc_name and svc_name not in seen_terms:
+                seen_terms.add(svc_name)
+                term = f"{svc_name} {svc_ver}".strip() if svc_ver else svc_name
+                query_items.append((f"{svc_name} {svc_ver}".strip(), term))
+                # Also inject into state.services for deduplication tracking
+                if not any(s["service"].lower() == svc_name.lower() for s in state.services):
+                    state.services.append({"port": "web", "service": svc_name, "version": svc_ver})
+
+    # 2. Nmap service versions (skip generic ones already covered)
     for svc in state.services:
-        # Focus on web technologies
-        svc_name_lower = svc["service"].lower()
-        if "http" not in svc_name_lower and "web" not in svc_name_lower and "apache" not in svc_name_lower and "nginx" not in svc_name_lower and "ftp" not in svc_name_lower:
+        svc_lower = svc["service"].lower()
+        # Focus: web stacks, ftp, ssh, smb, database services
+        relevant = (
+            "http" in svc_lower or "web" in svc_lower or
+            "apache" in svc_lower or "nginx" in svc_lower or
+            "iis" in svc_lower or "tomcat" in svc_lower or
+            "ftp" in svc_lower or "ssh" in svc_lower or
+            "smb" in svc_lower or "samba" in svc_lower or
+            "mysql" in svc_lower or "postgres" in svc_lower or
+            "mssql" in svc_lower or "mongo" in svc_lower or
+            "redis" in svc_lower or "elastic" in svc_lower
+        )
+        if not relevant:
             continue
-            
         ver_parts = svc.get("version", "").split()
-        terms = []
-        if ver_parts:
-            terms.append(f"{svc['service']} {ver_parts[0]}")
-        terms.append(svc["service"])
+        # Prefer "Service Version" → "Service" fallback
+        for term in (
+            [f"{svc['service']} {ver_parts[0]}", svc["service"]] if ver_parts
+            else [svc["service"]]
+        ):
+            if term not in seen_terms:
+                seen_terms.add(term)
+                query_items.append((term, term))
+
+    if not query_items:
+        info("No actionable terms to search.")
+        return
+
+    seen_edb_ids: set[str] = set()
+
+    # ── Run queries ──────────────────────────────────────────────────────────
+    with Progress(
+        SpinnerColumn(spinner_name="dots2", style="htb.red"),
+        TextColumn("[htb.dim]{task.description}"),
+        BarColumn(bar_width=None, style="red", complete_style="htb.red"),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+        expand=True,
+    ) as progress:
+        task_id = progress.add_task("Searchsploit Lookups", total=len(query_items))
         
-        for term in terms:
-            info(f"Querying: {term}")
-            hits = searchsploit_lookup(term)
+        for label, term in query_items:
+            progress.update(task_id, description=f"Searchsploit querying: [cyan]{label}[/]")
+            raw_hits = searchsploit_lookup(term)
+            
+            # Deduplicate by EDB-ID across all queries
+            hits = []
+            for h in raw_hits:
+                edb = h.get("EDB-ID")
+                if edb and edb not in seen_edb_ids:
+                    seen_edb_ids.add(edb)
+                    hits.append(h)
+                    
             if hits:
                 state.exploits[term] = hits[:10]
                 t = Table(
-                    title=f"[htb.red]⚡ Exploits → {term}[/]",
+                    title=f"[htb.red]⚡ Exploits → {label}[/]",
                     box=box.SIMPLE_HEAD, border_style="red",
                     expand=False
                 )
-                t.add_column("EDB-ID", style="bold cyan", width=8, justify="center")
-                t.add_column("Title", style="bold white", overflow="fold")
-                t.add_column("Type",  style="htb.yellow")
-                t.add_column("Path",  style="dim")
-                for h in hits[:8]:
-                    edb = h.get("EDB-ID", "")
-                    # Ensure Title wraps nicely
-                    t.add_row(edb, h.get("Title", ""), h.get("Type", ""), h.get("Path", ""))
+                t.add_column("EDB-ID", style="bold cyan",  width=8,  justify="center")
+                t.add_column("Title",  style="bold white",  overflow="fold")
+                t.add_column("CVE",    style="htb.yellow",  width=18)
+                t.add_column("Type",   style="htb.magenta", width=10)
+                for h in hits[:10]:
+                    edb   = h.get("EDB-ID", "")
+                    title = h.get("Title", "")
+                    codes = h.get("Codes", "")
+                    htype = h.get("Type", "")
+                    t.add_row(edb, title, codes, htype)
                 console.print(t)
-                break
-            else:
-                info(f"No results for: {term}")
+            progress.advance(task_id)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  REPORT GENERATOR
@@ -1449,6 +2124,24 @@ def generate_report(state: ReconState) -> Path:
             lines.append(f"- **Tech Hints:** {', '.join(fp['tech_hints'])}")
         if fp.get("whatweb"):
             lines.append(f"- **WhatWeb:** `{fp['whatweb'][:250]}`")
+        # Next.js detection results
+        nxt = fp.get("nextjs", {})
+        if nxt.get("detected"):
+            ver  = nxt.get("version", "")
+            rtr  = nxt.get("router", "unknown")
+            bid  = nxt.get("build_id", "")
+            lines.append("")
+            lines.append(f"#### ⚡ Framework: Next.js{' v'+ver if ver else ''}")
+            if rtr != "unknown": lines.append(f"- **Router:** {rtr}")
+            if bid:               lines.append(f"- **BuildId:** `{bid}`")
+            if nxt.get("indicators"):
+                lines.append("- **Detection evidence:**")
+                for ind in nxt["indicators"]:
+                    lines.append(f"  - `{ind}`")
+            if nxt.get("cves"):
+                lines.append("- **⚠️ CVE Alerts:**")
+                for cve in nxt["cves"]:
+                    lines.append(f"  - 🔴 `{cve}`")
         lines.append("")
 
     lines += ["## 4. Directory Fuzzing", ""]
@@ -1504,8 +2197,28 @@ def generate_report(state: ReconState) -> Path:
             lines.append(f"- {n}")
         lines.append("")
 
+    lines += ["## 9. Suggested Next Steps", ""]
+    port_ints = set()
+    for p in state.ports:
+        try: port_ints.add(int(p.split("/")[0]))
+        except ValueError: pass
+    
+    if port_ints & {80, 443, 8080, 8443}: lines.append("- **Web:** manual enumeration → LFI, SQLi, IDOR, auth bypass")
+    if 445 in port_ints: lines.append("- **SMB:** smbmap, netexec, check EternalBlue (MS17-010)")
+    if 5985 in port_ints: lines.append("- **WinRM:** evil-winrm with valid creds")
+    if 389 in port_ints: lines.append("- **LDAP:** BloodHound / ldapdomaindump for AD enumeration")
+    if 21 in port_ints: lines.append("- **FTP:** check anonymous upload, binary mode, bounce attack")
+    for v in state.vhosts: lines.append(f"- **VHost:** Enumerate vhost further: `{v}`")
+    if state.exploits: lines.append("- **Exploits:** Review searchsploit results — check Metasploit / PoC")
+    if state.directories: lines.append(f"- **Paths:** Investigate {len(state.directories)} discovered paths manually")
+    if state.fingerprints or state.services:
+        lines.append("- ⚠️ **Manual CVE Search:** Search Google/Exploit-DB manually for CVEs affecting the detected framework versions (Searchsploit may be outdated or incomplete).")
+        
+    lines.append("- 🎯 **Pwn:** Automated recon is complete. Time to get your hands dirty and pop some shells. Happy Hacking!")
+    lines.append("")
+
     lines += [
-        "## 9. Raw Nmap (Services Scan)",
+        "## 10. Raw Nmap (Services Scan)",
         "",
         "```",
         (state.nmap_raw[:8000] if state.nmap_raw else "(no output)"),
@@ -1524,6 +2237,13 @@ def generate_report(state: ReconState) -> Path:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_summary(state: ReconState, report_path: Optional[Path] = None) -> None:
+    # Deduplicate arrays to prevent bloat on re-runs
+    state.fingerprints = list({fp["url"]: fp for fp in state.fingerprints}.values())
+    state.quick_wins = list({qw.get("service", str(qw)): qw for qw in state.quick_wins}.values())
+    state.services = list({f"{s['port']}-{s['service']}": s for s in state.services}.values())
+    state.domains = list(dict.fromkeys(state.domains))
+    state.vhosts = list(dict.fromkeys(state.vhosts))
+    
     console.print()
     dur = elapsed(state.started_at)
 
@@ -1540,7 +2260,15 @@ def print_summary(state: ReconState, report_path: Optional[Path] = None) -> None
 
     node_web = tree.add(f"[htb.cyan]Web[/]  {len(state.fingerprints)} surface(s)")
     for fp in state.fingerprints:
-        node_web.add(f"[dim]{fp.get('url', '')}[/]  → {fp.get('title', '') or fp.get('server', '')}")
+        fp_node = node_web.add(f"[dim]{fp.get('url', '')}[/]  → {fp.get('title', '') or fp.get('server', '')}")
+        # Explicitly include full Next.js version detection strings if they exist
+        nxt = fp.get("nextjs", {})
+        if nxt.get("detected") and not any("Next.js" in h for h in fp.get("tech_hints", [])):
+            ver = nxt.get("version", "unknown")
+            fp.setdefault("tech_hints", []).append(f"Next.js {ver}")
+            
+        if fp.get("tech_hints"):
+            fp_node.add(f"[htb.yellow]Technologies:[/] {', '.join(fp['tech_hints'])}")
 
     node_dns = tree.add(f"[htb.cyan]Domains & VHosts[/]  {len(state.domains) + len(state.vhosts)}")
     for d in state.domains:
@@ -1576,16 +2304,32 @@ def print_summary(state: ReconState, report_path: Optional[Path] = None) -> None
             node_exp.add(f"[htb.red]{h.get('Title', '')[:60]}[/]")
 
     node_qw = tree.add("[htb.cyan]Protocol Checks[/]")
+    
+    expected_checks = {
+        "FTP":   "[dim]skip (port closed)[/]",
+        "SSH":   "[dim]skip (port closed)[/]",
+        "SMB":   "[dim]skip (port closed)[/]",
+        "RPC":   "[dim]skip (port closed)[/]",
+        "LDAP":  "[dim]skip (port closed)[/]",
+        "WinRM": "[dim]skip (port closed)[/]",
+        "NFS":   "[dim]skip (port closed)[/]"
+    }
+
     for qw in state.quick_wins:
+        svc = qw.get("service", "?")
         anon = (
             qw.get("anonymous") or
             qw.get("anonymous_bind") or
             bool(qw.get("shares")) or
             bool(qw.get("mounts")) or
+            bool(qw.get("users")) or
             qw.get("responding")
         )
         badge = "[htb.green]✔  HIT[/]" if anon else "[dim]✘  denied[/]"
-        node_qw.add(f"{qw.get('service', '?')}  {badge}")
+        expected_checks[svc] = badge
+
+    for svc, badge in expected_checks.items():
+        node_qw.add(f"{svc:<6} {badge}")
 
     if report_path:
         tree.add(f"[htb.cyan]Report[/]  {report_path}")
@@ -1602,8 +2346,6 @@ def print_summary(state: ReconState, report_path: Optional[Path] = None) -> None
         except ValueError:
             pass
 
-    if 22 in port_ints:
-        steps.append("SSH: try default creds / key-based auth / user enum")
     if port_ints & {80, 443, 8080, 8443}:
         steps.append("Web: manual enumeration → LFI, SQLi, IDOR, auth bypass")
     if 445 in port_ints:
@@ -1618,8 +2360,12 @@ def print_summary(state: ReconState, report_path: Optional[Path] = None) -> None
         steps.append(f"Enumerate vhost further: {v}")
     if state.exploits:
         steps.append("Review searchsploit results — check Metasploit / PoC")
+    if state.fingerprints or state.services:
+        steps.append("[bold htb.yellow]Search Google/Exploit-DB manually for CVEs affecting the detected framework versions (Searchsploit may be outdated or incomplete).[/]")
     if state.directories:
         steps.append(f"Investigate {len(state.directories)} discovered paths manually")
+    
+    steps.append("[bold htb.green]🎯 Pwn: Automated recon is complete. Time to get your hands dirty and pop some shells. Happy Hacking![/]")
 
     for i, step in enumerate(steps, 1):
         console.print(f"  [htb.magenta]{i}.[/]  {step}")
@@ -1804,29 +2550,34 @@ def main() -> None:
                 if main_domain not in state.domains:
                     state.domains.append(main_domain)
 
-            # Fingerprint via IP
-            section(f"WEB FINGERPRINT  ·  {url_ip}")
-            fp0 = fingerprint_web(url_ip)
-            state.fingerprints.append(fp0)
-            display_fingerprint(fp0)
-
-            # Detect redirect domain
-            if fp0.get("redirect_domain"):
-                rd = fp0["redirect_domain"].split(":")[0]
-                if rd not in state.domains and rd != state.target:
-                    state.domains.append(rd)
-                    state.notes.append(f"Domain via HTTP redirect: {rd}")
-                    section(f"/etc/hosts  ·  {rd}")
-                    add_hosts_entry(state.target, rd)
-
-            # Fingerprint via hostname
+            # Fingerprint via hostname if domain is known, else IP
             if main_domain:
                 url_host = make_url(scheme, main_domain, port)
-                if url_host != url_ip:
-                    section(f"WEB FINGERPRINT  ·  {url_host}")
-                    fp1 = fingerprint_web(url_host)
-                    state.fingerprints.append(fp1)
-                    display_fingerprint(fp1)
+                section(f"WEB FINGERPRINT  ·  {url_host}")
+                fp = fingerprint_web(url_host)
+                state.fingerprints.append(fp)
+                display_fingerprint(fp)
+            else:
+                section(f"WEB FINGERPRINT  ·  {url_ip}")
+                fp0 = fingerprint_web(url_ip)
+                state.fingerprints.append(fp0)
+                display_fingerprint(fp0)
+
+                # Detect redirect domain
+                if fp0.get("redirect_domain"):
+                    rd = fp0["redirect_domain"].split(":")[0]
+                    if rd not in state.domains and rd != state.target:
+                        state.domains.append(rd)
+                        state.notes.append(f"Domain via HTTP redirect: {rd}")
+                        section(f"/etc/hosts  ·  {rd}")
+                        add_hosts_entry(state.target, rd)
+                        
+                        # Fingerprint the newly discovered domain
+                        url_host = make_url(scheme, rd, port)
+                        section(f"WEB FINGERPRINT  ·  {url_host}")
+                        fp1 = fingerprint_web(url_host)
+                        state.fingerprints.append(fp1)
+                        display_fingerprint(fp1)
 
             # Passive spider
             spider_url = make_url(scheme, main_domain or state.target, port)
@@ -1912,26 +2663,9 @@ def main() -> None:
 
     # ── Phase 6: Searchsploit ─────────────────────────────────────────────────
     if not args.no_exploits:
-        # Extract technologies from web fingerprints to query searchsploit
-        for fp in state.fingerprints:
-            for key in ["server", "x_powered_by"]:
-                val = fp.get(key)
-                if val:
-                    # Clean up common noise like "(Debian)" or "(Free Edition)"
-                    clean_val = re.sub(r'\(.*?\)', '', val).strip()
-                    # If it has a version like "Apache/2.4.66", split it
-                    parts = clean_val.split("/")
-                    svc_name = parts[0].strip()
-                    svc_ver = parts[1].strip() if len(parts) > 1 else ""
-                    
-                    # Avoid duplicates
-                    if not any(s["service"].lower() == svc_name.lower() for s in state.services):
-                        state.services.append({
-                            "port": "web",
-                            "service": svc_name,
-                            "version": svc_ver
-                        })
-                        
+        # Fingerprints are already attached to state; run_searchsploit
+        # reads them directly to extract frameworks (Next.js, etc.) and
+        # server headers before falling back to nmap service names.
         run_searchsploit(state)
     else:
         info("Exploit search skipped (--no-exploits).")
